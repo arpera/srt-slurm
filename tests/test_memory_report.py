@@ -12,6 +12,7 @@ from unittest.mock import patch
 
 import pytest
 
+from srtctl.backends.vllm import VLLMServerConfig
 from srtctl.core.memory_report import (
     parse_worker_log,
     read_model_facts,
@@ -212,14 +213,19 @@ class TestRecording:
         return SimpleNamespace(log_dir=tmp_path, model_path=model_dir, gpus_per_node=4)
 
     @staticmethod
-    def _config():
+    def _config(vllm_config=None):
+        # The real schema type, not a dict: vllm_config is a dataclass with one
+        # flag dict per mode, and recipes may spell keys with either separator.
+        if vllm_config is None:
+            vllm_config = VLLMServerConfig(
+                prefill={"data_parallel_size": 16, "enable_expert_parallel": True},
+                decode={"data-parallel-size": 16, "enable-expert-parallel": True},
+            )
         return SimpleNamespace(
             served_model_name="my-model-fp4",
             benchmark=SimpleNamespace(concurrencies="512x1024", isl=8192, osl=1024),
             resources=SimpleNamespace(gpu_type="gb300"),
-            backend=SimpleNamespace(
-                vllm_config={"decode": {"data-parallel-size": 16, "enable-expert-parallel": True}}
-            ),
+            backend=SimpleNamespace(vllm_config=vllm_config),
         )
 
     def test_one_report_per_role(self, tmp_path, model_dir):
@@ -246,6 +252,24 @@ class TestRecording:
         record_memory_report(self._config(), self._runtime(tmp_path, model_dir))
 
         assert "DEP16, 4xGB300 per node" in (tmp_path / "memory" / "decode.out").read_text()
+
+    def test_underscored_recipe_keys_are_understood(self, tmp_path, model_dir):
+        """A recipe may write data_parallel_size instead of data-parallel-size."""
+        (tmp_path / "node01_prefill_w0.out").write_text(WORKER_LOG)
+
+        record_memory_report(self._config(), self._runtime(tmp_path, model_dir))
+
+        assert "DEP16" in (tmp_path / "memory" / "prefill.out").read_text()
+
+    def test_an_undescribable_layout_still_yields_a_report(self, tmp_path, model_dir):
+        """The layout is one cosmetic header line; it must not cost the report."""
+        (tmp_path / "node01_decode_w0.out").write_text(WORKER_LOG)
+
+        record_memory_report(self._config(vllm_config="not a config"), self._runtime(tmp_path, model_dir))
+
+        report = (tmp_path / "memory" / "decode.out").read_text()
+        assert "layout unknown" in report
+        assert "38.54 requests" in report
 
     def test_nothing_written_without_worker_logs(self, tmp_path, model_dir):
         assert record_memory_report(self._config(), self._runtime(tmp_path, model_dir)) == []

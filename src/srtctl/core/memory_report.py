@@ -507,7 +507,8 @@ def _record(config: SrtConfig, runtime: RuntimeContext) -> list[Path]:
             memory,
             facts,
             role=role,
-            layout=_layout(config, role, runtime),
+            # Cosmetic: never let the header line cost us the whole report.
+            layout=_safe_layout(config, role, runtime),
             nodes=len(logs),
             engines=max(memory.engines, 1) * len(logs),
             concurrency=concurrency,
@@ -524,10 +525,30 @@ def _record(config: SrtConfig, runtime: RuntimeContext) -> list[Path]:
     return written
 
 
+def _safe_layout(config: SrtConfig, role: str, runtime: RuntimeContext) -> str:
+    try:
+        return _layout(config, role, runtime)
+    except Exception as error:  # noqa: BLE001
+        logger.debug("Could not describe the %s layout: %s", role, error)
+        return "layout unknown"
+
+
+def _mode_flags(backend: object, role: str) -> dict[str, object]:
+    """The recipe's vLLM flags for one role, keyed the way the CLI spells them.
+
+    ``backend.vllm_config`` is a dataclass with a dict per mode, and a recipe may
+    write either ``data_parallel_size`` or ``data-parallel-size``.
+    """
+    vllm_config = getattr(backend, "vllm_config", None)
+    flags = getattr(vllm_config, _ROLE_CONFIG_KEY[role], None)
+    if not isinstance(flags, dict):
+        return {}
+    return {str(key).replace("_", "-"): value for key, value in flags.items()}
+
+
 def _layout(config: SrtConfig, role: str, runtime: RuntimeContext) -> str:
     """Name the parallel layout the way the recipe means it: DEP16, TP8, ..."""
-    vllm_config = getattr(config.backend, "vllm_config", None) or {}
-    mode = vllm_config.get(_ROLE_CONFIG_KEY[role], {}) or {}
+    mode = _mode_flags(config.backend, role)
     dp = mode.get("data-parallel-size")
     tp = mode.get("tensor-parallel-size")
     gpu = (config.resources.gpu_type or "gpu").upper()
@@ -536,7 +557,12 @@ def _layout(config: SrtConfig, role: str, runtime: RuntimeContext) -> str:
         parts.append(f"{'DEP' if mode.get('enable-expert-parallel') else 'DP'}{dp}")
     if tp and tp > 1:
         parts.append(f"TP{tp}")
-    layout = ", ".join(parts) if parts else "single GPU"
+    if parts:
+        layout = ", ".join(parts)
+    elif mode:
+        layout = "single GPU"  # flags for this role exist, none of them parallel
+    else:
+        layout = "layout unknown"  # the recipe says nothing about this role
     return f"{layout}, {runtime.gpus_per_node}x{gpu} per node"
 
 
