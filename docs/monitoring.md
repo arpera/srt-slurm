@@ -127,6 +127,10 @@ logs/4459_4P_1D_20251122_041341/
 ├── {node}_nginx.err                         # Nginx stderr
 ├── {node}_config.json                       # Per-node SGLang config dump
 │
+├── memory/                                  # Where each worker's GPU memory went
+│   ├── prefill.out                          # Budget, CUDA graphs, KV capacity
+│   └── decode.out
+│
 ├── cached_assets/                           # Cached model assets
 └── sa-bench_isl_1024_osl_1024/              # Benchmark results
     ├── isl_1024_osl_1024_concurrency_128_req_rate_inf.json
@@ -184,6 +188,56 @@ P99 TPOT (ms):                           22.36
 ### Worker Logs ({node}\_prefill_w0.err, {node}\_decode_w0.err)
 
 SGLang worker logs showing model loading, memory allocation, and runtime info. Check these for debugging CUDA errors, OOM issues, or NCCL failures.
+
+Once the workers exit, srtctl rewrites these logs for reading: the colour
+escapes the dynamo logger emits are stripped, and every progress bar is reduced
+to the frame a terminal would have been left showing. A checkpoint load stops
+being 102 near-identical lines:
+
+```
+(Worker_DP0_EP0 pid=942741) Loading safetensors checkpoint shards: 100% Completed | 100/100 [03:31<00:00,  2.11s/it]
+(Worker_DP0_EP0 pid=942741) [AutoTuner]: Tuning flashinfer::trtllm_fp4_block_scale_moe: 100%| 23/23 [01:20<00:00,  3.5s/profile]
+```
+
+Everything else is left byte for byte as the worker wrote it, and the surviving
+frame keeps its place in the file, so timestamps around it still line up.
+
+### memory/prefill.out, memory/decode.out
+
+Where a worker's GPU memory went and how many requests one engine can hold,
+written once the workers are up and before the benchmark starts. One file per
+role, numbers are per engine:
+
+```
+BUDGET  = total x gpu-memory-utilization = 276.62 x 0.92 = 254.49 GiB    :1890
+
+    - model weights                              168.89        :1342
+    - non-torch (NCCL buffers, allocator)          2.36        = 171.25 - 168.89
+    - peak activation (eager dummy forward)        3.68        = 36.74 - 33.06
+    - CUDA graph reservation (an estimate)        33.06        :1889 ("estimated")
+    ----------------------------------------------------
+    = KV cache                                    46.50        :1429
+```
+
+The report then derives the KV cost of one request from the model config (bytes
+per token, page size, blocks for attention plus one page per linear-attention
+layer), converts the KV budget into requests per engine, and ends with a VERDICT
+block that flags the two failures worth catching before a benchmark burns hours:
+
+```
+VERDICT
+  !! CUDA graph estimate overshoots by 286% (33.06 reserved, 8.57 used).
+     The 24.49 GiB lost is 20 requests per engine.
+     Recover with --kv-cache-memory=61814666240 (57.57 GiB -> 47.8 req/engine)
+  !! recipe concurrency 1024 needs 1024 / 16 = 64 requests per engine,
+     capacity is 38.54. 40% of the requests cannot be admitted
+```
+
+`:1890` is the line in the worker log the value was read from, so every number
+can be rechecked with `sed -n 1890p <node>_decode_w0.out`. Values whose log line
+is missing are printed as `NOT FOUND` together with the pattern that was looked
+for, and anything derived from them is left out — a missing pattern usually
+means the vLLM version changed its wording, and the report should not guess.
 
 ### config.yaml
 
