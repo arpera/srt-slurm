@@ -16,6 +16,12 @@ arithmetic derived from the model config, and writes one report per role to
 came from so the numbers can be rechecked by hand; anything that could not be
 found is printed as NOT FOUND rather than guessed, because a missing pattern
 means the vLLM version or the log wording changed.
+
+vLLM prints the line carrying the whole budget only after CUDA graph capture, so
+a startup that dies before that (an OOM, or the guard on max-num-seqs versus
+available Mamba blocks) would leave the report almost empty. For those runs the
+budget is rebuilt from the two lines printed before capture and labelled
+(derived), which is the one place this module computes instead of quoting.
 """
 
 from __future__ import annotations
@@ -24,6 +30,7 @@ import json
 import logging
 import math
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -56,6 +63,16 @@ _BUDGET = re.compile(
 )
 _WEIGHTS = re.compile(r"Model loading took ([\d.]+) GiB memory")
 _GRAPH_POOL = re.compile(r"CUDA graph pool memory: ([\d.]+) GiB \(actual\), ([\d.]+) GiB \(estimated\)")
+# Printed before capture, unlike _GRAPH_POOL, so this is what a startup that died
+# during capture leaves behind.
+_GRAPH_ESTIMATE = re.compile(r"Estimated CUDA graph memory: ([\d.]+) GiB total")
+# The advisory next to the KV cache size. The two utilizations differ by exactly
+# the graph estimate's share of the device, which is the only way to recover the
+# device size before vLLM prints it.
+_UTIL_ADVISORY = re.compile(
+    r"--gpu-memory-utilization=([\d.]+) is equivalent to "
+    r"--gpu-memory-utilization=([\d.]+) without CUDA graph memory profiling"
+)
 _GRAPH_PLAN = re.compile(r"Profiling CUDA graph memory: (.+)$")
 _GRAPH_PLAN_MODE = re.compile(r"(\w+)=(\d+) \(largest=(\d+)\)")
 _CAPTURE_SIZES = re.compile(r"'cudagraph_capture_sizes':\s*\[([\d,\s]+)\]")
@@ -65,6 +82,9 @@ _KV_TOKENS = re.compile(
 )
 _BLOCK_SIZE = re.compile(r"Setting attention block size to (\d+) tokens")
 _MAMBA_PAD = re.compile(r"Padding mamba page size by ([\d.]+)% ")
+# Only logged when the recipe overrides what the checkpoint asks for, which is
+# the one case where config.json alone would give the wrong SSM dtype.
+_SSM_DTYPE = re.compile(r"--mamba-ssm-cache-dtype='(\w+)' was passed")
 _KV_DTYPE = re.compile(r"kv_cache_dtype=torch\.(\w+)")
 _ENGINE_RANK = re.compile(r"\((?:Worker|EngineCore)_DP(\d+)")
 
@@ -95,6 +115,8 @@ class WorkerMemory:
     peak_activation_reported: Cited | None = None
     graphs_actual: Cited | None = None
     graphs_estimated: Cited | None = None
+    graphs_estimate_early: Cited | None = None
+    util_pair: Cited | None = None
     kv_to_budget: Cited | None = None
     kv_to_gpu: Cited | None = None
     weights: Cited | None = None
@@ -106,8 +128,10 @@ class WorkerMemory:
     kv_concurrency: Cited | None = None
     block_size: Cited | None = None
     block_size_text: str = ""
+    mamba_pad: Cited | None = None
     mamba_pad_text: str = ""
     mamba_pad_line: int = 0
+    ssm_dtype: Cited | None = None
     kv_dtype: Cited | None = None
     engines: int = 0
 
@@ -125,6 +149,26 @@ class WorkerMemory:
             return None
         return float(self.peak_activation_reported.value) - float(self.graphs_estimated.value)
 
+    @property
+    def graph_estimate(self) -> Cited | None:
+        """The graph reservation, preferring the post-capture line over the early one."""
+        return self.graphs_estimated or self.graphs_estimate_early
+
+    @property
+    def derived_total(self) -> Cited | None:
+        """Device size implied by the utilization advisory, for logs that stop early.
+
+        vLLM says utilization A behaves like B once the graph estimate is taken out
+        of the budget, so the estimate is (A - B) of the device. Both numbers are
+        rounded in the log, which puts the result within about a GiB of the truth.
+        """
+        if self.util_pair is None or self.graph_estimate is None:
+            return None
+        utilization, without_graphs = self.util_pair.value
+        if utilization <= without_graphs:
+            return None
+        return Cited(float(self.graph_estimate.value) / (utilization - without_graphs), self.util_pair.line)
+
 
 @dataclass
 class ModelFacts:
@@ -140,7 +184,18 @@ class ModelFacts:
     dtype: str | None = None
     num_experts: int | None = None
     experts_per_tok: int | None = None
+    # GDN (linear attention) state, one tensor pair per layer per request.
+    k_heads: int | None = None
+    v_heads: int | None = None
+    k_head_dim: int | None = None
+    v_head_dim: int | None = None
+    conv_kernel: int | None = None
+    mamba_ssm_dtype: str | None = None
     problems: list[str] = field(default_factory=list)
+
+    @property
+    def has_gdn_dims(self) -> bool:
+        return None not in (self.k_heads, self.v_heads, self.k_head_dim, self.v_head_dim, self.conv_kernel)
 
 
 def parse_worker_log(path: Path) -> WorkerMemory:
@@ -174,6 +229,10 @@ def parse_worker_log(path: Path) -> WorkerMemory:
             elif (match := _GRAPH_POOL.search(line)) and memory.graphs_actual is None:
                 memory.graphs_actual = Cited(float(match.group(1)), number)
                 memory.graphs_estimated = Cited(float(match.group(2)), number)
+            elif (match := _GRAPH_ESTIMATE.search(line)) and memory.graphs_estimate_early is None:
+                memory.graphs_estimate_early = Cited(float(match.group(1)), number)
+            elif (match := _UTIL_ADVISORY.search(line)) and memory.util_pair is None:
+                memory.util_pair = Cited((float(match.group(1)), float(match.group(2))), number)
             elif (match := _GRAPH_PLAN.search(line)) and memory.graph_plan is None:
                 modes = tuple(
                     (name, int(count), int(largest))
@@ -193,8 +252,11 @@ def parse_worker_log(path: Path) -> WorkerMemory:
                 memory.block_size = Cited(int(match.group(1)), number)
                 memory.block_size_text = line.split("] ", 1)[-1].strip()
             elif (match := _MAMBA_PAD.search(line)) and not memory.mamba_pad_text:
+                memory.mamba_pad = Cited(float(match.group(1)), number)
                 memory.mamba_pad_text = line.split("] ", 1)[-1].strip()
                 memory.mamba_pad_line = number
+            elif (match := _SSM_DTYPE.search(line)) and memory.ssm_dtype is None:
+                memory.ssm_dtype = Cited(match.group(1), number)
             elif (match := _KV_DTYPE.search(line)) and memory.kv_dtype is None:
                 memory.kv_dtype = Cited(match.group(1), number)
 
@@ -223,6 +285,12 @@ def read_model_facts(model_path: Path, name: str) -> ModelFacts:
     facts.dtype = text.get("dtype") or text.get("torch_dtype")
     facts.num_experts = text.get("num_experts")
     facts.experts_per_tok = text.get("num_experts_per_tok")
+    facts.k_heads = text.get("linear_num_key_heads")
+    facts.v_heads = text.get("linear_num_value_heads")
+    facts.k_head_dim = text.get("linear_key_head_dim")
+    facts.v_head_dim = text.get("linear_value_head_dim")
+    facts.conv_kernel = text.get("linear_conv_kernel_dim")
+    facts.mamba_ssm_dtype = text.get("mamba_ssm_dtype")
 
     layer_types = text.get("layer_types")
     if isinstance(layer_types, list):
@@ -240,6 +308,151 @@ def _missing(log_name: str, what: str) -> str:
 
 def _gib(value: float | None) -> str:
     return f"{value:.2f}" if value is not None else "   ?  "
+
+
+# Every value in the GPU MEMORY, BUDGET and CUDA GRAPHS blocks ends at the same
+# column, and the notes start at the same one, so the decimal points read as a
+# column. Padding baked into each literal cannot do that: it holds only for the
+# digit count of whatever log it was written against.
+_VALUE_END = 55
+_NOTE_START = _VALUE_END + 8
+
+
+def _row(label: str, value: str, note: str = "", unit: str = "") -> str:
+    """One label/value line of the memory blocks, with an optional note column."""
+    row = f"{label}{value:>{_VALUE_END - len(label)}}{unit}"
+    return f"{row:<{_NOTE_START}}{note}" if note else row
+
+
+def _factors(tokens: Sequence[tuple[str, str | None]], tail: str) -> list[str]:
+    """An arithmetic line plus an arrow naming every labelled factor.
+
+    Tokens are written out in order, so operators come in unlabelled. Arrow
+    columns are measured from the rendered line rather than written by hand,
+    which is what keeps them under the right factor when a model has wider
+    numbers than the one this was first read against.
+    """
+    line = ""
+    columns: list[tuple[int, str]] = []
+    for token, label in tokens:
+        if label is not None:
+            # Centred under the factor, the way the KV-per-token block reads.
+            columns.append((len(line) + len(token) // 2, label))
+        line += token
+
+    out = [line + tail]
+    text_column = columns[-1][0] + 5
+
+    def stems(width: int) -> str:
+        row = [" "] * width
+        for column, _ in columns:
+            if column < width:
+                row[column] = "|"
+        return "".join(row)
+
+    out.append(stems(columns[-1][0] + 1))
+    for column, label in reversed(columns):
+        out.append(f"{stems(column)}+{'-' * (text_column - column - 2)} {label}")
+    return out
+
+
+def _gdn_state_section(memory: WorkerMemory, facts: ModelFacts, page_mib: float | None) -> tuple[list[str], list[str]]:
+    """The two state tensors of one GDN layer, with the arithmetic spelled out.
+
+    The sizes come from config.json and the resolved dtypes, so they are a
+    computation rather than a quote. The log's own padding percentage is used to
+    check the result: a wrong dtype is otherwise invisible here and would
+    misprice every request downstream.
+    """
+    out = ["GDN STATE PER REQUEST, one GDN layer   (fixed size, it does not grow with tokens)", ""]
+
+    if not facts.has_gdn_dims:
+        out += ["  !! config.json has no linear_* keys: state size not derived", ""]
+        return out, ["GDN state"]
+
+    conv_dtype = str(facts.dtype)
+    ssm_dtype = str(memory.ssm_dtype.value) if memory.ssm_dtype else (facts.mamba_ssm_dtype or conv_dtype)
+    conv_width = _DTYPE_BYTES.get(conv_dtype)
+    ssm_width = _DTYPE_BYTES.get(ssm_dtype)
+    if not conv_width or not ssm_width:
+        out += [f"  !! unknown dtype (conv {conv_dtype}, ssm {ssm_dtype}): state size not derived", ""]
+        return out, ["GDN state"]
+
+    channels = facts.k_head_dim * facts.k_heads * 2 + facts.v_head_dim * facts.v_heads
+    conv_bytes = channels * (facts.conv_kernel - 1) * conv_width
+    ssm_bytes = facts.v_heads * facts.v_head_dim * facts.k_head_dim * ssm_width
+
+    out += [
+        "  conv state   the last kernel-1 inputs of the causal conv, one filter per",
+        "               channel, where the channels are q, k and v concatenated",
+        "",
+    ]
+    out += _factors(
+        [
+            ("      ( ", None),
+            (str(facts.k_head_dim), "q,k: linear_key_head_dim"),
+            ("  x  ", None),
+            (str(facts.k_heads), "q,k: linear_num_key_heads"),
+            ("  x  ", None),
+            ("2", "q and k, both this size"),
+            ("  +  ", None),
+            (str(facts.v_head_dim), "v: linear_value_head_dim"),
+            ("  x  ", None),
+            (str(facts.v_heads), "v: linear_num_value_heads"),
+            (" )", None),
+            ("  x  ", None),
+            (str(facts.conv_kernel - 1), "linear_conv_kernel_dim - 1"),
+            ("  x  ", None),
+            (str(conv_width), f"sizeof({conv_dtype})"),
+        ],
+        f"  =  {conv_bytes:,} B  =  {conv_bytes / 1024:g} KiB",
+    )
+    out += ["", "  ssm state    the recurrent matrix the whole context is folded into", ""]
+    out += _factors(
+        [
+            ("      ( ", None),
+            (str(facts.v_heads), "linear_num_value_heads"),
+            ("  x  ", None),
+            (str(facts.v_head_dim), "linear_value_head_dim"),
+            ("  x  ", None),
+            (str(facts.k_head_dim), "linear_key_head_dim"),
+            (" )", None),
+            ("  x  ", None),
+            (str(ssm_width), f"sizeof({ssm_dtype})"),
+        ],
+        f"  =  {ssm_bytes:,} B  =  {ssm_bytes / MIB:.4f} MiB",
+    )
+
+    state_mib = (conv_bytes + ssm_bytes) / MIB
+    out += ["", f"  conv + ssm = {state_mib:.4f} MiB per GDN layer"]
+    if memory.ssm_dtype:
+        out.append(
+            f"  ssm dtype is {ssm_dtype} from the recipe {memory.ssm_dtype.cite()}, "
+            f"overriding config.json mamba_ssm_dtype = {facts.mamba_ssm_dtype}"
+        )
+    else:
+        out.append(f"  ssm dtype {ssm_dtype} from config.json, conv dtype {conv_dtype} = model dtype")
+
+    if page_mib and memory.mamba_pad:
+        pad = float(memory.mamba_pad.value)
+        implied = page_mib / (1 + pad / 100)
+        if abs(implied - state_mib) <= 0.01 * state_mib:
+            out.append(
+                f"  the log pads that to the {page_mib:.3f} MiB page by {pad}%, so the two agree"
+                f"    :{memory.mamba_pad.line}"
+            )
+        else:
+            out += [
+                f"  !! the log pads the GDN page by {pad}% (:{memory.mamba_pad.line}), which implies",
+                f"     {implied:.4f} MiB per layer, not {state_mib:.4f}: the dtypes above are not",
+                "     what vLLM allocated, so every size derived from them is wrong",
+            ]
+    if page_mib:
+        out.append(
+            f"  x {facts.gdn} GDN layers = {facts.gdn * page_mib:.1f} MiB per request, charged once whatever the length"
+        )
+    out.append("")
+    return out, []
 
 
 def render_report(
@@ -270,13 +483,26 @@ def render_report(
 
     add("GPU MEMORY")
     if memory.total and memory.free:
-        add(f"  total on device                                {_gib(memory.total.value)} GiB    {memory.total.cite()}")
+        add(_row("  total on device", _gib(memory.total.value), memory.total.cite(), unit=" GiB"))
         add(
-            f"  in use before vLLM starts (CUDA context, driver)  "
-            f"{float(memory.total.value) - float(memory.free.value):.2f}"
-            f"        = {_gib(memory.total.value)} - {_gib(memory.free.value)}"
+            _row(
+                "  in use before vLLM starts (CUDA context, driver)",
+                f"{float(memory.total.value) - float(memory.free.value):.2f}",
+                f"= {_gib(memory.total.value)} - {_gib(memory.free.value)}",
+            )
         )
-        add(f"  free when vLLM took its snapshot               {_gib(memory.free.value)}        {memory.free.cite()}")
+        add(_row("  free when vLLM took its snapshot", _gib(memory.free.value), memory.free.cite()))
+    elif memory.derived_total and memory.util_pair and memory.graph_estimate:
+        derived = memory.derived_total
+        utilization, without_graphs = memory.util_pair.value
+        add(_row("  total on device", _gib(derived.value), f"{derived.cite()} (derived)", unit=" GiB"))
+        add(
+            f"    = {_gib(memory.graph_estimate.value)} GiB graph estimate / ({utilization} - {without_graphs})"
+            " utilization, that line's own arithmetic"
+        )
+        add("  free on startup and driver overhead are not in this log: vLLM prints them")
+        add("  only after graph capture, and this run stopped before that")
+        unknown.append("free memory on startup")
     else:
         add(f"  {_missing(memory.log_name, 'Free memory on device (.../... GiB) on startup')}")
         unknown.append("device memory")
@@ -290,36 +516,73 @@ def render_report(
         add("  note: the budget is a share of *total*, not of free, so the memory already")
         add("  in use above is spent twice on paper, and actual usage can exceed the budget.")
         add("")
-        weights = f"{_gib(memory.weights.value)}        {memory.weights.cite()}" if memory.weights else "   ?"
-        add(f"    - model weights                              {weights}")
+        if memory.weights:
+            add(_row("    - model weights", _gib(memory.weights.value), memory.weights.cite()))
+        else:
+            add(_row("    - model weights", "?"))
         non_torch = memory.non_torch
         if non_torch is not None and memory.consumed and memory.weights:
             add(
-                f"    - non-torch (NCCL buffers, allocator)          {non_torch:.2f}"
-                f"        = {_gib(memory.consumed.value)} - {_gib(memory.weights.value)}"
+                _row(
+                    "    - non-torch (NCCL buffers, allocator)",
+                    f"{non_torch:.2f}",
+                    f"= {_gib(memory.consumed.value)} - {_gib(memory.weights.value)}",
+                )
             )
         activation = memory.peak_activation
         if activation is not None and memory.peak_activation_reported and memory.graphs_estimated:
             add(
-                f"    - peak activation (eager dummy forward)        {activation:.2f}"
-                f"        = {_gib(memory.peak_activation_reported.value)}"
-                f" - {_gib(memory.graphs_estimated.value)}"
+                _row(
+                    "    - peak activation (eager dummy forward)",
+                    f"{activation:.2f}",
+                    f"= {_gib(memory.peak_activation_reported.value)} - {_gib(memory.graphs_estimated.value)}",
+                )
             )
         if memory.graphs_estimated:
             add(
-                f"    - CUDA graph reservation (an estimate)        {_gib(memory.graphs_estimated.value)}"
-                f'        {memory.graphs_estimated.cite()} ("estimated")'
+                _row(
+                    "    - CUDA graph reservation (an estimate)",
+                    _gib(memory.graphs_estimated.value),
+                    f'{memory.graphs_estimated.cite()} ("estimated")',
+                )
             )
         add("    ----------------------------------------------------")
         if memory.kv_memory:
-            add(
-                f"    = KV cache                                    {_gib(memory.kv_memory.value)}"
-                f"        {memory.kv_memory.cite()}"
-            )
+            add(_row("    = KV cache", _gib(memory.kv_memory.value), memory.kv_memory.cite()))
         add("")
         if memory.peak_activation_reported and memory.graphs_estimated:
             add(f'  the log prints {memory.peak_activation_reported.value} as "peak activation" because vLLM folds')
             add("  the graph estimate into that counter (gpu_worker.py:528); the two lines above split it")
+    elif memory.derived_total and memory.util_pair and memory.graph_estimate:
+        total = float(memory.derived_total.value)
+        estimate = memory.graph_estimate
+        utilization = memory.util_pair.value[0]
+        budget = total * utilization
+        add(
+            f"BUDGET  = total x gpu-memory-utilization = {_gib(total)} x {utilization} = "
+            f"{_gib(budget)} GiB    {memory.derived_total.cite()} (derived)"
+        )
+        add("")
+        if memory.weights:
+            add(_row("    - model weights", _gib(memory.weights.value), memory.weights.cite()))
+        if memory.weights and memory.kv_memory:
+            rest = budget - float(memory.weights.value) - float(estimate.value) - float(memory.kv_memory.value)
+            add(
+                _row(
+                    "    - non-torch + peak activation",
+                    f"{rest:.2f}",
+                    f"= {_gib(budget)} - {_gib(memory.weights.value)}"
+                    f" - {_gib(estimate.value)} - {_gib(memory.kv_memory.value)}",
+                )
+            )
+        add(_row("    - CUDA graph reservation (an estimate)", _gib(estimate.value), estimate.cite()))
+        add("    ----------------------------------------------------")
+        if memory.kv_memory:
+            add(_row("    = KV cache", _gib(memory.kv_memory.value), memory.kv_memory.cite()))
+        add("")
+        add("  non-torch and peak activation share one line: splitting them needs the")
+        add("  post-capture summary, which this run never printed")
+        unknown.append("non-torch / activation split")
     else:
         add(f"BUDGET  {_missing(memory.log_name, 'Desired GPU memory utilization is (util, N GiB)')}")
         unknown.append("budget")
@@ -331,14 +594,22 @@ def render_report(
         actual = float(memory.graphs_actual.value)
         # Same ratio vLLM prints in that line: how far the miss is above actual.
         over = ((estimated - actual) / actual * 100) if actual else 0.0
+        add(_row("  reserved from the estimate", _gib(estimated), memory.graphs_estimated.cite(), unit=" GiB"))
+        add(_row("  actually used after capture", _gib(actual), memory.graphs_actual.cite(), unit=" GiB"))
         add(
-            f"  reserved from the estimate                     {estimated:>6.2f} GiB    {memory.graphs_estimated.cite()}"
+            _row(
+                "  reserved and never used",
+                _gib(estimated - actual),
+                f"{over:.0f}% over  <-- see VERDICT",
+                unit=" GiB",
+            )
         )
-        add(f"  actually used after capture                    {actual:>6.2f} GiB    {memory.graphs_actual.cite()}")
-        add(
-            f"  reserved and never used                        {estimated - actual:>6.2f} GiB"
-            f"    {over:.0f}% over  <-- see VERDICT"
-        )
+    elif memory.graph_estimate:
+        estimate = memory.graph_estimate
+        add(_row("  reserved from the estimate", _gib(estimate.value), estimate.cite(), unit=" GiB"))
+        add(_row("  actually used after capture", "?", "printed only after capture", unit=" GiB"))
+        add("    this run stopped before that, so the overshoot cannot be checked")
+        unknown.append("graph pool (actual)")
     else:
         add(f"  {_missing(memory.log_name, 'CUDA graph pool memory: N GiB (actual), N GiB (estimated)')}")
         unknown.append("graph pool")
@@ -387,21 +658,32 @@ def render_report(
         per_token = facts.kv_heads * facts.head_dim * dtype_bytes * 2
         add("KV PER TOKEN, one Full Attn layer")
         add("")
-        add(
-            f"      ( {facts.kv_heads}  x  {facts.head_dim}  x  {dtype_bytes} )  x  2   "
-            f"=  {per_token} B  =  {per_token / 1024:g} KiB"
+        out.extend(
+            _factors(
+                [
+                    ("      ( ", None),
+                    (str(facts.kv_heads), "num_key_value_heads"),
+                    ("  x  ", None),
+                    (str(facts.head_dim), "head_dim"),
+                    ("  x  ", None),
+                    (str(dtype_bytes), f"sizeof({dtype})"),
+                    (" )", None),
+                    ("  x  ", None),
+                    ("2", "K and V"),
+                ],
+                f"   =  {per_token} B  =  {per_token / 1024:g} KiB",
+            )
         )
-        add("        |      |      |       |")
-        add("        |      |      |       +--- K and V")
-        add(f"        |      |      +----------- sizeof({dtype})")
-        add("        |      +------------------ head_dim")
-        add("        +------------------------- num_key_value_heads")
         add("")
 
-    page_mib = None
+    page_mib = int(memory.block_size.value) * per_token / MIB if memory.block_size and per_token else None
+    if facts.gdn:
+        gdn_lines, gdn_unknown = _gdn_state_section(memory, facts, page_mib)
+        out.extend(gdn_lines)
+        unknown.extend(gdn_unknown)
+
     if memory.block_size and per_token:
         block = int(memory.block_size.value)
-        page_mib = block * per_token / MIB
         add(f"BLOCK SIZE  {block} tokens, the same for Full Attn and GDN")
         add(f'  "{memory.block_size_text}"')
         add(f"{'':<50}{memory.log_name}:{memory.block_size.line}")

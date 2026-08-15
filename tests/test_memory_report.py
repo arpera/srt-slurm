@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -48,6 +49,24 @@ gpu_memory_utilization config with `--kv-cache-memory=40574291354` (37.79 GiB) t
 `--kv-cache-memory=61814666240` (57.57 GiB) to fully utilize gpu memory. Current kv cache memory in use is 46.5 GiB.
 """
 
+# The same startup, killed by the Mamba cudagraph guard: vLLM never reached the
+# lines it prints after capture, so only these two carry the budget. 0.8005 is
+# 0.92 - 33.06/276.62, which is how the real advisory line is computed.
+EARLY_EXIT_LOG = (
+    "\n".join(
+        line
+        for line in WORKER_LOG.splitlines()
+        if "CUDA graph pool" not in line and "Free memory on device" not in line
+    )
+    + """
+(Worker_DP0_EP0 pid=2) INFO 08-13 11:29:38 [gpu_model_runner.py:6881] Estimated CUDA graph memory: 33.06 GiB total
+(Worker_DP0_EP0 pid=2) INFO 08-13 11:29:38 [gpu_worker.py:579] CUDA graph memory profiling is enabled (default \
+since v0.21.0). The current --gpu-memory-utilization=0.9200 is equivalent to --gpu-memory-utilization=0.8005 \
+without CUDA graph memory profiling. To maintain the same effective KV cache size as before, increase \
+--gpu-memory-utilization to 0.9607.
+"""
+)
+
 MODEL_CONFIG = {
     "dtype": "bfloat16",
     "num_hidden_layers": 92,
@@ -56,6 +75,12 @@ MODEL_CONFIG = {
     "num_experts": 512,
     "num_experts_per_tok": 10,
     "layer_types": ["linear_attention"] * 69 + ["full_attention"] * 23,
+    "linear_num_key_heads": 16,
+    "linear_num_value_heads": 128,
+    "linear_key_head_dim": 128,
+    "linear_value_head_dim": 128,
+    "linear_conv_kernel_dim": 4,
+    "mamba_ssm_dtype": "bfloat16",
 }
 
 
@@ -63,6 +88,13 @@ MODEL_CONFIG = {
 def worker_log(tmp_path) -> Path:
     path = tmp_path / "node01_decode_w0.out"
     path.write_text(WORKER_LOG)
+    return path
+
+
+@pytest.fixture
+def early_exit_log(tmp_path) -> Path:
+    path = tmp_path / "node09_decode_w0.out"
+    path.write_text(EARLY_EXIT_LOG)
     return path
 
 
@@ -90,6 +122,36 @@ def _report(worker_log: Path, model_dir: Path, **overrides) -> str:
         read_model_facts(model_dir, "my-model-fp4"),
         **kwargs,
     )
+
+
+# Rows whose numbers have to read as one column. None of the labels holds a
+# digit, so the first number on the line is always the row's value.
+ALIGNED_LABELS = (
+    "  total on device",
+    "  in use before vLLM starts",
+    "  free when vLLM took its snapshot",
+    "  reserved from the estimate",
+    "  actually used after capture",
+    "  reserved and never used",
+    "    - model weights",
+    "    - non-torch",
+    "    - peak activation",
+    "    - CUDA graph reservation",
+    "    = KV cache",
+)
+
+
+def value_ends(report: str) -> dict[str, int]:
+    """The column each aligned row's value ends at, keyed by the row's label."""
+    ends = {}
+    for line in report.splitlines():
+        label = next((name for name in ALIGNED_LABELS if line.startswith(name)), None)
+        if label is None:
+            continue
+        match = re.search(r"-?\d+\.\d\d|\?", line)
+        assert match is not None, f"no value on an aligned row: {line}"
+        ends[line[: match.start()].rstrip()] = match.end()
+    return ends
 
 
 class TestParsing:
@@ -205,6 +267,160 @@ class TestReport:
         assert "NOT FOUND" in report
         assert "CUDA graph pool memory" in report
         assert "?? not derived, missing from the log: graph pool" in report
+
+
+class TestGdnState:
+    """The GDN state is per request, so its size decides how many requests fit."""
+
+    @staticmethod
+    def _model_dir(tmp_path: Path, **overrides) -> Path:
+        path = tmp_path / "fp32-ssm-model"
+        path.mkdir()
+        (path / "config.json").write_text(json.dumps({**MODEL_CONFIG, **overrides}))
+        return path
+
+    def test_both_tensors_are_spelled_out(self, worker_log, model_dir):
+        report = _report(worker_log, model_dir)
+
+        assert "( 128  x  16  x  2  +  128  x  128 )  x  3  x  2  =  122,880 B  =  120 KiB" in report
+        assert "( 128  x  128  x  128 )  x  2  =  4,194,304 B  =  4.0000 MiB" in report
+        assert "conv + ssm = 4.1172 MiB per GDN layer" in report
+        # 69 layers, each in a padded 4.125 MiB page, is what a request pays.
+        assert "x 69 GDN layers = 284.6 MiB per request" in report
+
+    def test_the_arrows_name_which_term_is_which(self, worker_log, model_dir):
+        report = _report(worker_log, model_dir)
+
+        assert "q and k, both this size" in report
+        assert "v: linear_num_value_heads" in report
+        assert "linear_conv_kernel_dim - 1" in report
+
+    def test_the_result_is_checked_against_the_logged_padding(self, worker_log, model_dir):
+        report = _report(worker_log, model_dir)
+
+        # 4.1172 MiB padded by 0.19% is the 4.125 MiB page the log reports.
+        assert "the log pads that to the 4.125 MiB page by 0.19%, so the two agree" in report
+
+    def test_a_recipe_override_is_preferred_over_config_json(self, tmp_path, model_dir):
+        """The checkpoint asks for float32; the recipe's bfloat16 is what runs."""
+        path = tmp_path / "node01_decode_w0.out"
+        path.write_text(
+            WORKER_LOG + "(Worker_DP0_EP0 pid=2) WARNING 08-13 11:22:28 [config.py:775] Qwen3.5 model "
+            "specifies mamba_ssm_dtype='float32' in its config, but "
+            "--mamba-ssm-cache-dtype='bfloat16' was passed. Using the user-specified value.\n"
+        )
+
+        report = _report(path, self._model_dir(tmp_path, mamba_ssm_dtype="float32"))
+
+        assert "conv + ssm = 4.1172 MiB per GDN layer" in report
+        assert "overriding config.json mamba_ssm_dtype = float32" in report
+
+    def test_a_dtype_that_contradicts_the_log_is_flagged(self, worker_log, tmp_path):
+        """Reading float32 for the ssm state doubles it, and the log disagrees."""
+        report = _report(worker_log, self._model_dir(tmp_path, mamba_ssm_dtype="float32"))
+
+        # 4 MiB ssm becomes 8 MiB, conv stays bfloat16 at 120 KiB.
+        assert "8.1172 MiB per GDN layer" in report
+        assert "not 8.1172: the dtypes above are not" in report
+        # Flagged in place, not quietly dropped into the list of missing values.
+        assert not any("GDN state" in line for line in report.splitlines() if line.startswith("  ??"))
+
+    def test_a_model_without_the_linear_keys_says_so(self, worker_log, tmp_path):
+        path = tmp_path / "no-linear-keys"
+        path.mkdir()
+        config = {key: value for key, value in MODEL_CONFIG.items() if not key.startswith("linear_")}
+        (path / "config.json").write_text(json.dumps(config))
+
+        report = _report(worker_log, path)
+
+        assert "config.json has no linear_* keys: state size not derived" in report
+        assert "missing from the log: " in report
+
+
+class TestAlignment:
+    """A report is read by eye, so the numbers have to sit in one column."""
+
+    def test_every_value_ends_in_the_same_column(self, worker_log, model_dir):
+        ends = value_ends(_report(worker_log, model_dir))
+
+        assert len(ends) >= 8
+        assert set(ends.values()) == {55}, ends
+
+    def test_the_derived_report_keeps_that_column(self, early_exit_log, model_dir):
+        ends = value_ends(_report(early_exit_log, model_dir))
+
+        assert len(ends) >= 5
+        assert set(ends.values()) == {55}, ends
+
+    def test_a_digit_more_or_less_does_not_shift_a_row(self, tmp_path, model_dir):
+        """Padding written per row holds only for the log it was measured against."""
+        path = tmp_path / "node01_decode_w0.out"
+        path.write_text(
+            WORKER_LOG.replace("168.89", "68.89")  # weights lose a digit
+            .replace("46.50", "146.50")  # KV cache gains one
+            .replace("33.06", "3.06")  # the graph estimate loses one
+        )
+
+        ends = value_ends(_report(path, model_dir))
+
+        assert set(ends.values()) == {55}, ends
+
+
+class TestStartupThatDiedBeforeCapture:
+    """A guard can kill the engine before vLLM prints its memory summary.
+
+    Two lines survive: the pre-capture graph estimate and the utilization
+    advisory. Together they still pin down the device size and the budget.
+    """
+
+    def test_device_size_is_derived_from_the_utilization_advisory(self, early_exit_log):
+        memory = parse_worker_log(early_exit_log)
+
+        assert memory.total is None
+        # The full log of the same startup says 276.62 GiB.
+        assert memory.derived_total.value == pytest.approx(276.62, abs=0.1)
+        assert memory.graph_estimate.value == 33.06
+
+    def test_budget_is_rebuilt_from_the_lines_that_are_left(self, early_exit_log, model_dir):
+        report = _report(early_exit_log, model_dir)
+
+        assert "BUDGET  = total x gpu-memory-utilization = 276.65 x 0.92 = 254.52 GiB" in report
+        assert "(derived)" in report
+        # 254.52 - 168.89 weights - 33.06 graphs - 46.50 KV, which vLLM would
+        # otherwise print split into non-torch and peak activation.
+        assert "- non-torch + peak activation" in report
+        assert "6.07" in report
+
+    def test_the_missing_graph_actual_is_named_not_guessed(self, early_exit_log, model_dir):
+        report = _report(early_exit_log, model_dir)
+
+        assert "reserved from the estimate" in report
+        assert "actually used after capture" in report
+        assert "286% over" not in report
+        assert "CUDA graph estimate overshoots" not in report
+        assert "graph pool (actual)" in report
+
+    def test_capacity_still_comes_out(self, early_exit_log, model_dir):
+        """The KV numbers are printed before capture, so they must survive."""
+        report = _report(early_exit_log, model_dir)
+
+        assert "38.54 requests = 394,633 tokens" in report
+        assert "299 x 4.125 MiB = 1233 MiB per request" in report
+
+    def test_a_log_without_either_line_still_says_not_found(self, tmp_path, model_dir):
+        path = tmp_path / "node09_decode_w0.out"
+        path.write_text(
+            "\n".join(
+                line
+                for line in EARLY_EXIT_LOG.splitlines()
+                if "Estimated CUDA graph memory" not in line and "is equivalent to" not in line
+            )
+        )
+
+        report = _report(path, model_dir)
+
+        assert "Free memory on device (.../... GiB) on startup" in report
+        assert "Desired GPU memory utilization is (util, N GiB)" in report
 
 
 class TestRecording:

@@ -224,6 +224,13 @@ per token, page size, blocks for attention plus one page per linear-attention
 layer), converts the KV budget into requests per engine, and ends with a VERDICT
 block that flags the two failures worth catching before a benchmark burns hours:
 
+For hybrid models the two GDN state tensors are broken out the same way, with an
+arrow naming every factor, because that state is charged per request rather than
+per token and is usually the part that decides how many requests fit. Its size
+depends on the resolved mamba dtypes, so the result is cross-checked against the
+padding percentage vLLM logs: if the two disagree, the report says so instead of
+pricing every request from a dtype the engine never used.
+
 ```
 VERDICT
   !! CUDA graph estimate overshoots by 286% (33.06 reserved, 8.57 used).
@@ -238,6 +245,23 @@ can be rechecked with `sed -n 1890p <node>_decode_w0.out`. Values whose log line
 is missing are printed as `NOT FOUND` together with the pattern that was looked
 for, and anything derived from them is left out — a missing pattern usually
 means the vLLM version changed its wording, and the report should not guess.
+
+The budget line above is printed by vLLM only after CUDA graph capture, so a
+startup that dies earlier (an OOM, or the guard that rejects `max-num-seqs`
+above the available Mamba blocks) leaves it out entirely. In that case the
+report rebuilds the same block from the two lines vLLM prints before capture,
+marks the header `(derived)`, and reports non-torch and peak activation as one
+remainder, since only the missing line splits them:
+
+```
+GPU MEMORY
+  total on device                                276.76 GiB    :204 (derived)
+    = 10.60 GiB graph estimate / (0.92 - 0.8817) utilization, that line's own arithmetic
+```
+
+The device size comes out within about a GiB, because both utilizations are
+rounded in the log. The graph reservation is still shown, but the actual pool
+size after capture is left as `?`: without it the overshoot cannot be checked.
 
 ### config.yaml
 
