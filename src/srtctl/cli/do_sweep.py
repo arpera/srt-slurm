@@ -36,6 +36,8 @@ from srtctl.cli.mixins import (
 from srtctl.core.config import load_config
 from srtctl.core.health import wait_for_port
 from srtctl.core.lockfile import write_lockfile
+from srtctl.core.log_cleanup import clean_worker_logs
+from srtctl.core.memory_report import record_memory_report
 from srtctl.core.processes import (
     ManagedProcess,
     ProcessRegistry,
@@ -728,6 +730,11 @@ class SweepOrchestrator(
 
             self._print_connection_info()
 
+            # Workers have finished reporting their memory decisions by now, so
+            # the report (and its capacity verdict) lands before the benchmark
+            # spends hours proving the same point.
+            record_memory_report(self.config, self.runtime)
+
             if os.environ.get("EVAL_ONLY", "false").lower() == "true":
                 reporter.report(JobStatus.BENCHMARK, JobStage.BENCHMARK, "Running eval-only evaluation")
                 logger.info("EVAL_ONLY=true: Skipping benchmark stage and running lm-eval evaluation...")
@@ -765,6 +772,12 @@ class SweepOrchestrator(
             exit_code = self.finalize_power_telemetry(exit_code, interrupted=stop_event.is_set())
             stop_event.set()
             registry.cleanup()
+            # Workers have exited, so their logs can be rewritten for humans:
+            # escapes stripped, progress bars collapsed. Redo the memory reports
+            # afterwards so the line numbers they cite match the cleaned files,
+            # and do it before print_failure_details so an excerpt is readable.
+            if clean_worker_logs(self.runtime.log_dir):
+                record_memory_report(self.config, self.runtime)
             if exit_code != 0:
                 registry.print_failure_details()
             # Post-process first: generate rollup, upload logs to S3, eagerly
